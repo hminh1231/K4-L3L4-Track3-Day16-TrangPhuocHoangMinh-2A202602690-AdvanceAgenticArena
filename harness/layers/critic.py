@@ -70,6 +70,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+from harness.layers._text import source_of
 from harness.middleware import Middleware
 
 
@@ -79,16 +80,48 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list):
+            return report
+        kept, dropped = [], 0
+        for claim in claims:
+            text = claim.get("text") if isinstance(claim, dict) else None
+            if not isinstance(text, str) or not text.strip():
+                dropped += 1
+            elif source_of(ctx, text) is not None:
+                kept.append(claim)
+            else:
+                halves = self._split(ctx, text)
+                if halves:
+                    kept.extend({**claim, "text": half, "doc_id": doc_id} for half, doc_id in halves)
+                    report["abstain"] = True
+                    ctx.state["critic_split"] = ctx.state.get("critic_split", 0) + 1
+                else:
+                    dropped += 1
+        ctx.state["critic_dropped"] = ctx.state.get("critic_dropped", 0) + dropped
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept if isinstance(c.get("doc_id"), str)})
+        if not kept:
+            report["abstain"] = True
+            report["answer"] = (
+                "Không đủ căn cứ: các tài liệu đã đọc không chứa thông tin "
+                "để trả lời câu hỏi này, nên tôi không đưa ra con số hay kết luận nào."
+            )
+        return report
+
+    @staticmethod
+    def _split(ctx, text: str):
+        """Tách câu bị ghép từ hai nguồn mâu thuẫn tại chỗ dán; None nếu không được.
+
+        Chỉ CẮT chữ mô hình đã viết (substring + bỏ khoảng trắng hai đầu),
+        không thêm bớt ký tự nào bên trong.
+        """
+        for sep in (" và ", "; ", ", nhưng ", " nhưng ", " trong khi "):
+            start = text.find(sep)
+            while start != -1:
+                left, right = text[:start].strip(), text[start + len(sep):].strip()
+                src_l, src_r = source_of(ctx, left), source_of(ctx, right)
+                if src_l and src_r and src_l != src_r:
+                    return [(left, src_l), (right, src_r)]
+                start = text.find(sep, start + 1)
+        return None
