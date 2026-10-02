@@ -110,6 +110,7 @@ from dataclasses import dataclass, field
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
     TOOL_ERROR_PREFIX,
+    MockModel,
     parse_output,
 )
 from arena.tools import ToolResult
@@ -162,6 +163,23 @@ _PLACEHOLDER_RE = re.compile(r"\A[\s.…·\-–—]*\Z")
 #: (`arena.model._FINAL_RE`). Used ONLY to locate marker lines — every
 #: payload on this path is still decoded by `parse_output` itself.
 _FINAL_MARKER = "FINAL:"
+
+#: How many times ONE RUN may send a premature FINAL back. Trên bảng xếp
+#: hạng model thật, mọi bài đều dừng ở lượt 1 (`single_model_call`): model
+#: abstain mà chưa gọi công cụ nào -> 0 claim -> sàn 39.47. Prompt chỉ
+#: KHUYÊN tìm trước; chặn ở vòng lặp thì BẮT BUỘC. Có giới hạn để một model
+#: cứng đầu vẫn kết thúc được, và FINAL bị trả lại vẫn được giữ làm dự phòng.
+MAX_PREMATURE_REFUSALS = 2
+
+NUDGE_SEARCH_FIRST = (
+    "Bạn chưa gọi công cụ nào nên chưa được kết luận. Lượt này hãy viết THOUGHT "
+    "rồi ACTION gọi search với truy vấn ngắn chứa các thuật ngữ chính của câu hỏi."
+)
+NUDGE_FETCH_FIRST = (
+    "Bạn mới chỉ xem kết quả search, chưa đọc toàn văn tài liệu nào, nên chưa được "
+    "kết luận là không đủ căn cứ. Lượt này hãy viết THOUGHT rồi ACTION gọi fetch_doc "
+    "với doc_id liên quan nhất ở trên, hoặc search lại bằng thuật ngữ khác."
+)
 
 # ---------------------------------------------------------------------------
 # The real-model prompt addendum
@@ -273,6 +291,32 @@ def real_model_system_prompt(base: str = ARENA_SYSTEM_PROMPT) -> str:
 #: must pass as `system_prompt`; not the default (see the module
 #: docstring for the measured reason).
 ARENA_SYSTEM_PROMPT_REAL = real_model_system_prompt()
+
+
+def _is_mock(model) -> bool:
+    """Is the innermost model `MockModel`? The frozen runner wraps the
+    model in `ProvenanceModel`, which keeps the original on `.inner`."""
+    for _ in range(5):
+        if model is None:
+            return False
+        if isinstance(model, MockModel):
+            return True
+        model = getattr(model, "inner", None)
+    return False
+
+
+def _prompt_for(model, system_prompt: str) -> str:
+    """The prompt this agent actually sends.
+
+    `arena.runner._build_agent` passes `system_prompt=` explicitly — the
+    bare frozen prompt — so `ARENA_SYSTEM_PROMPT_REAL` never reached a real
+    endpoint and every entry stopped on turn one. The addendum is therefore
+    attached here, for every model except `MockModel` (where it is neutral
+    but costs efficiency through the mock's token estimator).
+    """
+    if _is_mock(model) or REAL_MODEL_PROMPT_ADDENDUM.strip() in system_prompt:
+        return system_prompt
+    return real_model_system_prompt(system_prompt)
 
 #: `output_text` is clamped to this before it is stamped on `model_call`.
 #: `Trace.emit` truncates any record over 90,000 characters, and a
@@ -480,13 +524,15 @@ class ReActAgent:
         # one already, so a caller that does not pass one still works.
         self.corpus = corpus if corpus is not None else getattr(tools, "_corpus", None)
         self.max_steps = max(1, int(max_steps))
-        self.system_prompt = system_prompt
+        self.system_prompt = _prompt_for(model, system_prompt)
         self.last_context: AgentContext | None = None
         # Per-run bookkeeping for the two `_parse` guards. Reset in
         # `run()`; kept on the agent rather than in `ctx.state`, which
         # belongs to the layers.
         self._final_deferrals = 0
         self._refused_final: dict | None = None
+        self._premature_refusals = 0
+        self._tools_ok: set = set()
 
     # -- the run -------------------------------------------------------
 
@@ -503,6 +549,8 @@ class ReActAgent:
         self.last_context = ctx
         self._final_deferrals = 0
         self._refused_final = None
+        self._premature_refusals = 0
+        self._tools_ok = set()
 
         self.trace.emit("agent_start", brief_id=str(brief.get("brief_id", "")))
 
@@ -532,9 +580,16 @@ class ReActAgent:
             ctx.messages.append({"role": "assistant", "content": text})
 
             if parsed.kind == "final":
-                report = parsed.final if isinstance(parsed.final, dict) else {}
-                ctx.stop_reason = "final"
-                break
+                nudge = self._premature(ctx, parsed.final)
+                if nudge is None:
+                    report = parsed.final if isinstance(parsed.final, dict) else {}
+                    ctx.stop_reason = "final"
+                    break
+                # Not evidence, so not an observation: a one-off instruction.
+                if isinstance(parsed.final, dict):
+                    self._refused_final = parsed.final
+                ctx.messages.append({"role": "user", "content": nudge})
+                continue
 
             observation = self._observe(ctx, parsed)
             ctx.observations.append(observation)
@@ -612,6 +667,30 @@ class ReActAgent:
         # this path exists precisely to look underneath one.
         return parse_output(_without_quoted_finals(text))
 
+    def _premature(self, ctx: AgentContext, final):
+        """The nudge to send back if this FINAL came before any looking, else None.
+
+        Two cases, both measured as "abstain floor with zero gradient":
+        no successful tool call at all, or giving up (abstain / no real
+        claim) having only seen search snippets. Never fires once the
+        budget is down to the submit reserve, and at most
+        `MAX_PREMATURE_REFUSALS` times per run.
+        """
+        if self._premature_refusals >= MAX_PREMATURE_REFUSALS:
+            return None
+        limit = ctx.max_tool_calls
+        if limit is not None and ctx.tools.calls >= limit - 1:
+            return None
+        if not self._tools_ok & {"search", "fetch_doc"}:
+            nudge = NUDGE_SEARCH_FIRST
+        elif "fetch_doc" not in self._tools_ok and _gives_up(final):
+            nudge = NUDGE_FETCH_FIRST
+        else:
+            return None
+        self._premature_refusals += 1
+        ctx.state["agent_premature_finals"] = self._premature_refusals
+        return nudge
+
     # -- the model -----------------------------------------------------
 
     def _call_model(self, messages: list[dict]):
@@ -659,6 +738,8 @@ class ReActAgent:
         result = call(parsed.tool, dict(parsed.args))
         if result is None or not hasattr(result, "ok"):
             return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {parsed.tool}"
+        if result.ok:
+            self._tools_ok.add(parsed.tool)
         return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
 
     def _dispatch(self, name: str, args: dict) -> ToolResult:
@@ -671,6 +752,17 @@ class ReActAgent:
         if name == "calc":
             return self.tools.calc(_as_text(args.get("expression")) or "0")
         return ToolResult(ok=False, content="", error=f"unknown tool: {name!r}")
+
+
+def _gives_up(final) -> bool:
+    """A FINAL that abstains or carries no claim with real text."""
+    if not isinstance(final, dict) or final.get("abstain") is True:
+        return True
+    claims = final.get("claims")
+    return not (
+        isinstance(claims, list)
+        and any(isinstance(c, dict) and not _is_placeholder(c.get("text")) for c in claims)
+    )
 
 
 def _as_text(value) -> str:
